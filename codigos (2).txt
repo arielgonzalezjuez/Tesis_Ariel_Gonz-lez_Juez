@@ -1,0 +1,213 @@
+Inicio de Sesion
+
+def inicio_sesion(request):
+    if request.method == 'GET':
+        return render(request, 'sign in.html', {'form':AuthenticationForm})
+    else:
+        cliente = authenticate(request,username=request.POST['username'], password=request.POST['password'])
+        if cliente is None:
+            return render(request, 'sign in.html', {'form':AuthenticationForm, 'error':'Usuario o contraseña incorrectos'})
+        else:
+            login(request,cliente)
+            return redirect('index')
+
+
+Registrar Admin
+
+def registrarAdminFirstTime(request):
+    if request.method == 'GET':
+        return render(request, 'sign_up.html', {'form': UserCreationForm})
+    else:
+        if request.POST['password1'] == request.POST['password2']:
+            try:
+                user = User.objects.create_user(username=request.POST['username'], password=request.POST['password1'])
+                user.save()
+                login(request,user)
+                return redirect('index')
+            except IntegrityError:
+                return render(request, 'sign_up.html', {'form': UserCreationForm, 'error':'Usuario ya existente'})
+        return render(request, 'sign_up.html', {'form': UserCreationForm, 'error':'Contraseñas Incorrectas'})
+
+Registrar Trabajador
+
+@login_required
+def registrar_persona(request):
+    title = 'Registrar Persona'
+    if request.method == 'POST':
+        form = PersonaForm(request.POST, request.FILES)
+        if form.is_valid():
+            form.save()
+            return redirect('trabajadores')
+    else:
+        form = PersonaForm()
+    return render(request, 'trabajadores.html', {'form': form, 'title': title})
+
+
+Reconocimineto
+
+face_cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+face_cascade = cv2.CascadeClassifier(face_cascade_path)
+
+# Cargar imágenes de referencia conocidas y calcular histogramas
+referencias_rostros = []
+nombres_rostros = []
+
+# Cargar los rostros desde la base de datos
+personas = Persona.objects.all()
+
+# Función para guardar la imagen del rostro capturado
+def save_face_image(face_img):
+    filename = f"captura_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.jpg"
+    folder = os.path.join(settings.MEDIA_ROOT, 'imagenes_capturadas')
+    os.makedirs(folder, exist_ok=True)
+    filepath = os.path.join(folder, filename)
+    cv2.imwrite(filepath, face_img)
+    return filepath
+
+# Optimización de la carga de rostros y histogramas
+for persona in personas:
+    if persona.imagen:  # Verificar que exista imagen cargada
+        ruta_imagen = os.path.join(settings.MEDIA_ROOT, str(persona.imagen))
+        img = cv2.imread(ruta_imagen)
+        if img is not None:
+            gris = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            rostros = face_cascade.detectMultiScale(gris, scaleFactor=1.1, minNeighbors=5)
+            if len(rostros) > 0:
+                (x, y, w, h) = rostros[0]
+                rostro_conocido = gris[y:y + h, x:x + w]
+                histograma_rostro = cv2.calcHist([rostro_conocido], [0], None, [256], [0, 256])
+                referencias_rostros.append(histograma_rostro)
+                nombres_rostros.append(persona.nombre)
+
+# Configuración de la cámara ONVIF
+def setup_onvif_camera(ip, port, user, password):
+    # Crear una instancia de ONVIFCamera
+    mycam = ONVIFCamera(ip, port, user, password)
+
+    # Obtener el servicio de medios
+    media_service = mycam.create_media_service()
+
+    # Obtener los perfiles de la cámara
+    profiles = media_service.GetProfiles()
+
+    # Seleccionar el primer perfil
+    profile_token = profiles[0].token
+
+    # Obtener la URL del stream RTSP
+    stream_uri = media_service.GetStreamUri({'StreamSetup': {'Stream': 'RTP-Unicast', 'Transport': {'Protocol': 'RTSP'}}, 'ProfileToken': profile_token})
+
+    return stream_uri.Uri
+
+# Generador de frames para el streaming
+def gen(rtsp_url):
+    cap = cv2.VideoCapture(rtsp_url)
+
+    fecha_hora = datetime.now().strftime("%Y%m%d_%H%M")  # Formato: AAAAMMDD_HHMMSS
+    nombre_video = f"video_{fecha_hora}.mp4"  # Usamos .mp4 para compatibilidad
+    ruta_video = os.path.join(settings.MEDIA_ROOT, 'videos_capturados', nombre_video)
+
+    # Asegurarse de que el directorio exista
+    os.makedirs(os.path.dirname(ruta_video), exist_ok=True)
+
+    # Configurar el codec y el objeto VideoWriter
+    fourcc = cv2.VideoWriter_fourcc(*'h264')  # Codec MJPEG para mejor rendimiento
+    frame_width = int(cap.get(3))
+    frame_height = int(cap.get(4))
+    out = cv2.VideoWriter(ruta_video, fourcc, 20.0, (frame_width, frame_height))
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # Reducir resolución para procesamiento rápido
+            frame_resized = cv2.resize(frame, (640, 480))
+            gris = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2GRAY)
+
+            rostros_detectados = face_cascade.detectMultiScale(gris, scaleFactor=1.1, minNeighbors=5)
+
+            for (x, y, w, h) in rostros_detectados:
+                rostro_actual = gris[y:y + h, x:x + w]
+                histograma_actual = cv2.calcHist([rostro_actual], [0], None, [256], [0, 256])
+
+                nombre = "Desconocido"
+                color_rectangulo = (0, 0, 255)  # Rojo para desconocido
+
+                # Comparación mediante histogramas
+                for idx, histograma_conocido in enumerate(referencias_rostros):
+                    similitud = cv2.compareHist(histograma_conocido, histograma_actual, cv2.HISTCMP_CORREL)
+
+                    if similitud > 0.7:  # Ajustar umbral si es necesario
+                        nombre = nombres_rostros[idx]
+                        rostro_conocido = frame[y:y+h, x:x+w]
+                        _, img_bytes = cv2.imencode('.jpg', rostro_conocido)  # Convertir el rostro a JPEG
+
+                        # Crear un nombre único para la imagen capturada
+                        imagen_nombre = f"rostro_conocido_{str(int(time.time()))}.jpg"
+                        imagen_path = os.path.join(settings.MEDIA_ROOT, 'imagenes_capturadas', imagen_nombre)
+
+                        # Guardar la imagen en el sistema de archivos
+                        default_storage.save(imagen_path, ContentFile(img_bytes.tobytes()))
+
+                        # Crear la instancia de RegistroAcceso con la imagen guardada
+                        imagen_guardada = f'imagenes_capturadas/{imagen_nombre}'
+                        color_rectangulo = (0, 255, 0)  # Verde para conocido
+                        persona = Persona.objects.get(nombre=nombre)
+                        RegistroAcceso.objects.create(persona=persona, imagen_capturada=imagen_guardada)
+                        break
+
+                # Si es desconocido, capturar la imagen del rostro y guardarla
+                if nombre == "Desconocido":
+                    rostro_desconocido = frame[y:y+h, x:x+w]
+                    _, img_bytes = cv2.imencode('.jpg', rostro_desconocido)  # Convertir el rostro a JPEG
+
+                    # Crear un nombre único para la imagen capturada
+                    imagen_nombre = f"rostro_desconocido_{str(int(time.time()))}.jpg"
+                    imagen_path = os.path.join(settings.MEDIA_ROOT, 'imagenes_capturadas', imagen_nombre)
+
+                    # Guardar la imagen en el sistema de archivos
+                    default_storage.save(imagen_path, ContentFile(img_bytes.tobytes()))
+
+                    # Crear la instancia de RegistroAcceso con la imagen guardada
+                    imagen_guardada = f'imagenes_capturadas/{imagen_nombre}'  # Ruta relativa para la imagen
+                    RegistroAcceso.objects.create(imagen_capturada=imagen_guardada)
+
+                # Dibujar rectángulo y nombre
+                cv2.rectangle(frame, (x, y), (x + w, y + h), color_rectangulo, 2)
+                cv2.putText(frame, nombre, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color_rectangulo, 2)
+
+            # Codificar el frame como JPEG para el streaming
+            ret, jpeg = cv2.imencode('.jpg', frame)
+            if not ret:
+                break
+
+            # Guardar el frame en el archivo de video
+            out.write(frame)
+
+            # Convertir el frame en un formato adecuado para HTTP
+            frame = jpeg.tobytes()
+
+            # Usamos un generador para enviar los frames
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n\r\n')
+    except GeneratorExit:
+        print("El cliente cerró la conexión. Deteniendo el streaming.")
+    finally:
+        # Una vez terminado el streaming, cerrar el archivo de video
+        out.release()
+        cap.release()
+
+        # Guardar el video en la base de datos
+        video = Video.objects.create(title=nombre_video, file=f'videos_capturados/{nombre_video}')
+        video.save()
+def video_feed(request):
+    if request.method == 'POST':
+        camera_id = request.POST.get('camara')
+        try:
+            camara = Camara.objects.get(id=camera_id)
+        except ONVIFError:
+            return render(request,'reconocimiento.html', {'message': 'Cámara no encontrada'})
+    
+    rtsp_url = setup_onvif_camera(camara.numero_ip, camara.puerto, camara.usuario, camara.password)
+    return StreamingHttpResponse(gen(), content_type='multipart/x-mixed-replace; boundary=frame')
